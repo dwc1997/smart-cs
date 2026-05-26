@@ -1,6 +1,7 @@
 """本地控制台调试入口
 
 交互式问答控制台，支持流式输出和实时调试。
+统一通过 CSEngine 执行（意图分类 → 路由 → ReAct）。
 """
 
 import asyncio
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config.settings import OPENAI_API_KEY
-from core.react_agent import ReActAgent
+from core.cs_engine import cs_engine
 from core.memory_manager import memory_manager
 from core.prompt_builder import build_system_prompt
 from tools.registry import registry
@@ -26,6 +27,7 @@ from tools.registry import registry
 def print_banner():
     print("=" * 60)
     print("  Smart-CS 智能客服调试控制台")
+    print("  统一执行引擎：意图分类 → 路由 → ReAct")
     print("  输入 'quit' 或 'exit' 退出")
     print("  输入 'tools' 查看可用工具")
     print("  输入 'memory <user_id>' 查看用户记忆")
@@ -61,7 +63,6 @@ async def chat_loop():
 
     session_id = f"console-{uuid.uuid4().hex[:8]}"
     user_id = "console-user"
-    agent = ReActAgent(max_iterations=10)
 
     memory_manager.create_session(session_id, user_id=user_id)
     print(f"会话 ID: {session_id}\n")
@@ -108,17 +109,25 @@ async def chat_loop():
         if user_context:
             message_content = f"<memory-context>\n{user_context}\n</memory-context>\n\n{user_input}"
 
-        # 流式执行
+        # 流式执行（通过统一引擎）
         print("\n客服: ", end="", flush=True)
         full_response = ""
 
-        async for event in agent.run_streaming(
+        async for event in cs_engine.run_streaming(
             messages=[{"role": "user", "content": message_content}],
             system_prompt=system_prompt,
+            user_id=user_id,
         ):
             event_type = event.get("type", "")
 
-            if event_type == "token":
+            if event_type == "intent_classified":
+                intent = event["intent"]
+                confidence = event["confidence"]
+                summary = event["summary"]
+                print(f"\n  [意图: {intent} | 置信度: {confidence:.2f} | {summary}]", flush=True)
+                print("客服: ", end="", flush=True)
+
+            elif event_type == "token":
                 content = event["content"]
                 print(content, end="", flush=True)
                 full_response += content

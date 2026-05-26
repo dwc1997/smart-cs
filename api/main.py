@@ -1,6 +1,7 @@
 """FastAPI 应用
 
 智能客服 API 服务，支持 SSE 流式输出。
+统一通过 CSEngine 执行（意图分类 → 路由 → ReAct）。
 """
 
 import asyncio
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from api.models import QueryRequest, ResumeRequest, QueryResponse, HealthResponse
-from core.react_agent import ReActAgent
+from core.cs_engine import cs_engine
 from core.memory_manager import memory_manager
 from core.prompt_builder import build_system_prompt
 from tools.registry import registry
@@ -121,19 +122,25 @@ async def query(request: QueryRequest):
     if user_context:
         user_message = f"<memory-context>\n{user_context}\n</memory-context>\n\n{request.query}"
 
-    agent = ReActAgent()
-
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
             yield _to_sse_data({"type": "start", "session_id": session_id})
 
-            async for event in agent.run_streaming(
+            async for event in cs_engine.run_streaming(
                 messages=[{"role": "user", "content": user_message}],
                 system_prompt=system_prompt,
+                user_id=user_id,
             ):
                 event_type = event.get("type", "")
 
-                if event_type == "token":
+                if event_type == "intent_classified":
+                    yield _to_sse_data({
+                        "type": "intent",
+                        "intent": event["intent"],
+                        "confidence": event["confidence"],
+                        "summary": event["summary"],
+                    })
+                elif event_type == "token":
                     yield _to_sse_data({"type": "text", "content": event["content"]})
                 elif event_type == "tool_call":
                     yield _to_sse_data({
