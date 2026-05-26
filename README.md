@@ -187,7 +187,7 @@ smart-cs/
 
 ### 🔴 P0 — 核心架构补全（面试必问）
 
-- [ ] **统一执行路径** — 当前存在两条并行路径（LangGraph 图 vs ReActAgent），API/CLI 绕过 Graph 直接调用 ReActAgent。需要统一为 Graph 驱动，ReAct 作为 Graph 内部节点
+- [x] **统一执行路径** — 当前存在两条并行路径（LangGraph 图 vs ReActAgent），API/CLI 绕过 Graph 直接调用 ReActAgent。需要统一为 Graph 驱动，ReAct 作为 Graph 内部节点
 - [ ] **集成上下文压缩到主流程** — `context_compressor.py` 已实现但从未被调用，需要在 ReAct 循环中自动触发压缩（参考 Hermes 的 ContextEngine 抽象）
 - [ ] **LangGraph Checkpointer** — 用 `MemorySaver` 或 `SqliteSaver` 实现真正的 Graph 状态持久化，支持会话恢复
 - [ ] **Agent Loop 健壮性** — 参考 Hermes 的 IterationBudget（预算制）+ ErrorClassifier（错误分类 → 重试/降级/中止）+ ToolGuardrails（循环检测 → 熔断）
