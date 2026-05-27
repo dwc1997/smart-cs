@@ -2,6 +2,7 @@
 
 智能客服 API 服务，支持 SSE 流式输出。
 统一通过 CSEngine 执行（意图分类 → 路由 → ReAct）。
+支持 LangGraph interrupt/resume 实现人机交互确认。
 """
 
 import asyncio
@@ -18,11 +19,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 load_dotenv()
 
+from langgraph.types import Command
+
 from api.models import QueryRequest, ResumeRequest, QueryResponse, HealthResponse
 from core.cs_engine import cs_engine
 from core.memory_manager import memory_manager
 from core.prompt_builder import build_system_prompt
 from tools.registry import registry
+from graphs.cs_graph import cs_graph
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +101,14 @@ async def health():
 
 @app.post("/api/v1/query")
 async def query(request: QueryRequest):
-    """SSE 流式查询端点。"""
+    """SSE 流式查询端点。
+
+    使用 LangGraph cs_graph 执行，支持 interrupt/resume。
+    当图在 confirm_intent 节点中断时，返回 interrupt 事件和 thread_id，
+    客户端可通过 /api/v1/resume 恢复执行。
+    """
     session_id = request.session_id or f"session-{uuid.uuid4().hex[:8]}"
+    thread_id = f"thread-{uuid.uuid4().hex[:12]}"
     user_id = request.user_id or "anonymous"
 
     # 创建会话
@@ -122,55 +132,74 @@ async def query(request: QueryRequest):
     if user_context:
         user_message = f"<memory-context>\n{user_context}\n</memory-context>\n\n{request.query}"
 
+    # 构建图初始状态
+    initial_state = {
+        "user_query": user_message,
+        "original_input": request.query,
+        "session_id": session_id,
+        "user_id": user_id,
+        "current_step": "start",
+        "current_mode": "direct_answer",
+        "intent_confirmed": False,
+        "error_messages": [],
+        "planned_tasks": [],
+        "tool_execution_results": [],
+        "retrieval_queries": [],
+        "retrieval_results": [],
+        "short_term_memory": [],
+        "metadata": {"system_prompt": system_prompt},
+    }
+
+    graph_config = {"configurable": {"thread_id": thread_id}}
+
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
-            yield _to_sse_data({"type": "start", "session_id": session_id})
+            yield _to_sse_data({"type": "start", "session_id": session_id, "thread_id": thread_id})
 
-            async for event in cs_engine.run_streaming(
-                messages=[{"role": "user", "content": user_message}],
-                system_prompt=system_prompt,
-                user_id=user_id,
-            ):
-                event_type = event.get("type", "")
+            # 使用 cs_graph.stream 执行图
+            async for chunk in cs_graph.astream(initial_state, config=graph_config, stream_mode="updates"):
+                # chunk 是 {node_name: state_update} 的字典
+                for node_name, node_output in chunk.items():
+                    if node_name == "__interrupt__":
+                        # 图被 interrupt() 暂停
+                        interrupt_data = node_output
+                        if isinstance(interrupt_data, (list, tuple)) and len(interrupt_data) > 0:
+                            interrupt_value = interrupt_data[0].value if hasattr(interrupt_data[0], 'value') else interrupt_data[0]
+                        elif hasattr(interrupt_data, 'value'):
+                            interrupt_value = interrupt_data.value
+                        else:
+                            interrupt_value = interrupt_data
 
-                if event_type == "intent_classified":
-                    yield _to_sse_data({
-                        "type": "intent",
-                        "intent": event["intent"],
-                        "confidence": event["confidence"],
-                        "summary": event["summary"],
-                    })
-                elif event_type == "token":
-                    yield _to_sse_data({"type": "text", "content": event["content"]})
-                elif event_type == "tool_call":
-                    yield _to_sse_data({
-                        "type": "tool_call",
-                        "name": event["name"],
-                        "args": event["args"],
-                    })
-                elif event_type == "tool_result":
-                    yield _to_sse_data({
-                        "type": "tool_result",
-                        "name": event["name"],
-                        "result": event["result"],
-                    })
-                elif event_type == "clarification":
-                    yield _to_sse_data({
-                        "type": "interrupt",
-                        "payload": event["data"],
-                    })
-                elif event_type == "final":
-                    # 保存回答到会话
-                    memory_manager.add_message(session_id, "assistant", event["content"])
-                    yield _to_sse_data({
-                        "type": "final",
-                        "content": event["content"],
-                        "session_id": session_id,
-                        "iterations": event.get("iterations", 0),
-                        "tool_calls": event.get("tool_calls", []),
-                    })
-                elif event_type == "error":
-                    yield _to_sse_data({"type": "error", "error": event["error"]})
+                        yield _to_sse_data({
+                            "type": "interrupt",
+                            "thread_id": thread_id,
+                            "session_id": session_id,
+                            "payload": interrupt_value,
+                        })
+                        logger.info(f"Graph interrupted, thread_id={thread_id}")
+                        continue
+
+                    # 普通节点输出
+                    if node_name == "classify_intent" and isinstance(node_output, dict):
+                        intent_analysis = node_output.get("intent_analysis", {})
+                        if intent_analysis:
+                            yield _to_sse_data({
+                                "type": "intent",
+                                "intent": intent_analysis.get("intent_type", "general"),
+                                "confidence": intent_analysis.get("confidence", 0),
+                                "summary": intent_analysis.get("summary", ""),
+                            })
+
+                    elif node_name == "generate_answer" and isinstance(node_output, dict):
+                        answer = node_output.get("metadata", {}).get("final_answer", "")
+                        if answer:
+                            memory_manager.add_message(session_id, "assistant", answer)
+                            yield _to_sse_data({
+                                "type": "final",
+                                "content": answer,
+                                "session_id": session_id,
+                                "thread_id": thread_id,
+                            })
 
             yield _to_sse_data({"type": "done"})
 
@@ -191,9 +220,84 @@ async def query(request: QueryRequest):
 
 @app.post("/api/v1/resume")
 async def resume(request: ResumeRequest):
-    """恢复中断的对话。"""
-    # TODO: 实现 interrupt/resume 机制
-    raise HTTPException(status_code=501, detail="Resume not yet implemented")
+    """恢复中断的对话。
+
+    使用 LangGraph 的 Command(resume=...) 机制恢复被 interrupt() 暂停的图执行。
+    客户端需要提供 thread_id（来自 interrupt 事件）和用户回复。
+    """
+    thread_id = request.thread_id
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id is required")
+
+    session_id = request.session_id or f"session-{uuid.uuid4().hex[:8]}"
+
+    # 构建用户回复数据
+    user_response = {
+        "message": request.message,
+        "confirmed_intent": request.confirmed_intent,
+    }
+    # 兼容旧的 decision 字段
+    if request.decision:
+        user_response.update(request.decision)
+
+    graph_config = {"configurable": {"thread_id": thread_id}}
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            yield _to_sse_data({"type": "resume_start", "thread_id": thread_id, "session_id": session_id})
+
+            # 使用 Command(resume=...) 恢复图执行
+            async for chunk in cs_graph.astream(
+                Command(resume=user_response),
+                config=graph_config,
+                stream_mode="updates",
+            ):
+                for node_name, node_output in chunk.items():
+                    if node_name == "__interrupt__":
+                        # 再次中断（理论上不应该，但做防御处理）
+                        interrupt_data = node_output
+                        if isinstance(interrupt_data, (list, tuple)) and len(interrupt_data) > 0:
+                            interrupt_value = interrupt_data[0].value if hasattr(interrupt_data[0], 'value') else interrupt_data[0]
+                        elif hasattr(interrupt_data, 'value'):
+                            interrupt_value = interrupt_data.value
+                        else:
+                            interrupt_value = interrupt_data
+
+                        yield _to_sse_data({
+                            "type": "interrupt",
+                            "thread_id": thread_id,
+                            "session_id": session_id,
+                            "payload": interrupt_value,
+                        })
+                        continue
+
+                    # 普通节点输出
+                    if node_name == "generate_answer" and isinstance(node_output, dict):
+                        answer = node_output.get("metadata", {}).get("final_answer", "")
+                        if answer:
+                            memory_manager.add_message(session_id, "assistant", answer)
+                            yield _to_sse_data({
+                                "type": "final",
+                                "content": answer,
+                                "session_id": session_id,
+                                "thread_id": thread_id,
+                            })
+
+            yield _to_sse_data({"type": "done"})
+
+        except Exception as e:
+            logger.error(f"Resume error: {e}", exc_info=True)
+            yield _to_sse_data({"type": "error", "error": str(e)})
+            yield _to_sse_data({"type": "done"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/v1/tools")

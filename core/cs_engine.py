@@ -4,9 +4,9 @@
 API 和 CLI 都通过这个引擎执行，不再直接调用 ReActAgent。
 
 执行流程：
-  用户输入 → 意图分类 → 工具集选择 → ReAct 循环 → 输出
+  用户输入 → 意图分类 → 子智能体选择 → ReAct 循环 → 输出
                 ↓              ↓
-          (LLM 分类)    (根据意图过滤工具)
+          (LLM 分类)    (根据意图路由到专用智能体)
 """
 
 import json
@@ -32,7 +32,7 @@ from tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
-# 意图 → 工具集映射
+# 意图 → 工具集映射（保留用于向后兼容和工具预览）
 INTENT_TOOLSET_MAP = {
     "query": ["knowledge", "memory"],
     "complaint": ["knowledge", "ticket", "memory"],
@@ -42,6 +42,34 @@ INTENT_TOOLSET_MAP = {
     "general": ["knowledge", "memory"],
     "human_transfer": ["memory"],
 }
+
+
+# -------------------------------------------------------------------
+# 意图 → 专用子智能体映射
+# -------------------------------------------------------------------
+# 懒加载：首次使用时才导入，避免循环导入
+_SUB_AGENT_CLASSES = None
+
+
+def _get_sub_agent_classes() -> Dict[str, type]:
+    """延迟导入子智能体类，返回 intent → AgentClass 映射。"""
+    global _SUB_AGENT_CLASSES
+    if _SUB_AGENT_CLASSES is None:
+        from agents.query_agent import QueryAgent
+        from agents.complaint_agent import ComplaintAgent
+        from agents.billing_agent import BillingAgent
+        from agents.transfer_agent import TransferAgent
+
+        _SUB_AGENT_CLASSES = {
+            "query": QueryAgent,
+            "complaint": ComplaintAgent,
+            "technical": QueryAgent,       # 技术问题用查询智能体
+            "business": ComplaintAgent,     # 业务办理用投诉智能体（有工单权限）
+            "billing": BillingAgent,
+            "general": QueryAgent,          # 通用闲聊用查询智能体
+            "human_transfer": TransferAgent,
+        }
+    return _SUB_AGENT_CLASSES
 
 # 意图分类 prompt
 INTENT_CLASSIFY_PROMPT = """你是一个意图分类器。根据用户输入，判断意图类型。
@@ -109,7 +137,7 @@ class CSEngine:
                     {"role": "user", "content": user_query},
                 ],
                 temperature=0.1,
-                max_tokens=200,
+                max_tokens=2048,
             )
             content = resp.choices[0].message.content or ""
 
@@ -162,35 +190,44 @@ class CSEngine:
 
         return compress_messages(messages, summary, compress_end=boundary)
 
+    def get_agent_for_intent(self, intent: str):
+        """根据意图获取对应的专用子智能体实例。"""
+        agent_classes = _get_sub_agent_classes()
+        agent_cls = agent_classes.get(intent)
+        if agent_cls is None:
+            # fallback: 使用 QueryAgent
+            from agents.query_agent import QueryAgent
+            agent_cls = QueryAgent
+            logger.warning(f"Unknown intent '{intent}', falling back to QueryAgent")
+        return agent_cls()
+
     async def run(
         self,
         messages: List[dict],
         system_prompt: str = "",
         user_id: str = "anonymous",
     ) -> dict:
-        """统一执行入口（同步模式）。"""
+        """统一执行入口（同步模式）。
+
+        意图分类 → 选择专用子智能体 → 子智能体执行（隔离工具集）
+        """
         # 1. 意图分类
         user_query = self._extract_user_query(messages)
         intent_result = await self.classify_intent(user_query)
         intent = intent_result["intent"]
         logger.info(f"Intent: {intent} (confidence: {intent_result['confidence']:.2f})")
 
-        # 2. 选择工具
-        tool_filter = self.select_tools_for_intent(intent)
+        # 2. 选择子智能体
+        agent = self.get_agent_for_intent(intent)
+        logger.info(f"Dispatching to agent: {agent.name}")
 
         # 3. 上下文压缩
         messages = await self._maybe_compress(messages, system_prompt)
 
-        # 4. ReAct 执行
-        agent = ReActAgent(
-            max_iterations=self.max_iterations,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
+        # 4. 子智能体执行（每个智能体有自己的工具集和参数）
         result = await agent.run(
             messages=messages,
             system_prompt=system_prompt,
-            tools=tool_filter,
         )
 
         result["intent"] = intent_result
@@ -202,7 +239,10 @@ class CSEngine:
         system_prompt: str = "",
         user_id: str = "anonymous",
     ) -> AsyncGenerator[dict, None]:
-        """统一执行入口（流式模式）。"""
+        """统一执行入口（流式模式）。
+
+        意图分类 → 选择专用子智能体 → 子智能体流式执行
+        """
         # 1. 意图分类
         user_query = self._extract_user_query(messages)
         intent_result = await self.classify_intent(user_query)
@@ -216,22 +256,23 @@ class CSEngine:
             "summary": intent_result["summary"],
         }
 
-        # 2. 选择工具
-        tool_filter = self.select_tools_for_intent(intent)
+        # 2. 选择子智能体
+        agent = self.get_agent_for_intent(intent)
+        logger.info(f"Dispatching to agent: {agent.name}")
+
+        yield {
+            "type": "agent_selected",
+            "agent": agent.name,
+            "toolsets": agent.allowed_toolsets,
+        }
 
         # 3. 上下文压缩
         messages = await self._maybe_compress(messages, system_prompt)
 
-        # 4. ReAct 流式执行
-        agent = ReActAgent(
-            max_iterations=self.max_iterations,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
+        # 4. 子智能体流式执行（事件类型兼容旧接口）
         async for event in agent.run_streaming(
             messages=messages,
             system_prompt=system_prompt,
-            tools=tool_filter,
         ):
             yield event
 

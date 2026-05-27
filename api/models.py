@@ -13,8 +13,11 @@ class QueryRequest(BaseModel):
 
 class ResumeRequest(BaseModel):
     """恢复中断请求"""
-    session_id: str = Field(..., description="会话 ID")
-    decision: Dict[str, Any] = Field(..., description="用户决策")
+    thread_id: str = Field(..., description="线程 ID（来自 interrupt 事件）")
+    message: str = Field("", description="用户回复消息")
+    confirmed_intent: Optional[str] = Field(None, description="用户确认的意图类型（可选）")
+    session_id: Optional[str] = Field(None, description="会话 ID（兼容旧接口）")
+    decision: Optional[Dict[str, Any]] = Field(None, description="用户决策（兼容旧接口）")
 
 
 class QueryResponse(BaseModel):

@@ -82,10 +82,13 @@ smart-cs/
 │   └── TOOLS.md             # 工具使用规范
 │
 ├── core/                    # 核心引擎
+│   ├── cs_engine.py         # 统一执行引擎（意图→路由→多Agent）
+│   ├── react_agent.py       # ReAct 循环引擎
+│   ├── error_classifier.py  # 错误分类器（6类→重试/降级/中止）
+│   ├── tool_guardrails.py   # 工具调用守卫（循环检测→熔断）
 │   ├── prompt_builder.py    # 5层 Prompt 组装器
 │   ├── session_db.py        # SQLite + FTS5 会话存储
 │   ├── memory_manager.py    # 冻结快照 + 记忆召回
-│   ├── react_agent.py       # ReAct 循环引擎
 │   └── context_compressor.py # 上下文压缩工具
 │
 ├── tools/                   # 工具注册表 + 工具实现
@@ -96,12 +99,14 @@ smart-cs/
 │   ├── clarification_tools.py # 推荐问/澄清
 │   └── memory_tools.py      # 记忆存储/召回/历史搜索
 │
-├── agents/                  # 多智能体
-│   ├── base_agent.py        # 抽象基类
-│   ├── customer_service_agent.py # 主编排 Agent
-│   ├── retrieval_agent.py   # 知识检索 Agent
-│   ├── calculation_agent.py # 计费计算 Agent
-│   └── knowledge_graph_agent.py # 知识图谱 Agent (TODO)
+├── agents/                  # 多智能体（工具隔离 + 独立上下文）
+│   ├── base_react_agent.py  # 子Agent基类（工具集隔离）
+│   ├── query_agent.py       # 查询Agent（knowledge + memory）
+│   ├── complaint_agent.py   # 投诉Agent（knowledge + ticket + memory）
+│   ├── billing_agent.py     # 计费Agent（knowledge + calculation + memory）
+│   ├── transfer_agent.py    # 转人工Agent（memory only）
+│   ├── base_agent.py        # 旧抽象基类（兼容）
+│   └── customer_service_agent.py # 旧主编排（兼容）
 │
 ├── graphs/                  # LangGraph 图定义
 │   └── cs_graph.py          # 意图→路由→执行 工作流
@@ -150,9 +155,11 @@ smart-cs/
 ### 🤖 Multi-Agent
 | 特性 | 状态 | 说明 |
 |------|------|------|
-| 意图识别路由 | ✅ | LLM 分类 → 子Agent分发 |
-| 子Agent编排 | ✅ | Retrieval / Calculation / KnowledgeGraph |
-| 工单自动创建 | ✅ | 投诉类意图自动建高优先级工单 |
+| 意图识别路由 | ✅ | LLM 分类 → 动态子Agent分发 |
+| 子Agent工具隔离 | ✅ | 每个Agent只能看到自己的工具集 |
+| 4个专用Agent | ✅ | Query(5工具) / Complaint(8) / Billing(7) / Transfer(3) |
+| 工单自动创建 | ✅ | 投诉Agent自动建高优先级工单 |
+| 独立参数 | ✅ | 每个Agent可配不同温度/迭代数/系统提示 |
 
 ### 🔧 工具系统
 | 特性 | 状态 | 说明 |
@@ -188,10 +195,10 @@ smart-cs/
 ### 🔴 P0 — 核心架构补全（面试必问）
 
 - [x] **统一执行路径** — 当前存在两条并行路径（LangGraph 图 vs ReActAgent），API/CLI 绕过 Graph 直接调用 ReActAgent。需要统一为 Graph 驱动，ReAct 作为 Graph 内部节点
-- [ ] **集成上下文压缩到主流程** — `context_compressor.py` 已实现但从未被调用，需要在 ReAct 循环中自动触发压缩（参考 Hermes 的 ContextEngine 抽象）
-- [ ] **LangGraph Checkpointer** — 用 `MemorySaver` 或 `SqliteSaver` 实现真正的 Graph 状态持久化，支持会话恢复
-- [ ] **Agent Loop 健壮性** — 参考 Hermes 的 IterationBudget（预算制）+ ErrorClassifier（错误分类 → 重试/降级/中止）+ ToolGuardrails（循环检测 → 熔断）
-- [ ] **中断/恢复机制** — API 的 `/resume` 端点返回 501，需要实现真正的 interrupt → human-in-the-loop → resume 流程
+- [x] **集成上下文压缩到主流程** — CSEngine 自动检测上下文膨胀并触发 LLM 摘要压缩
+- [x] **LangGraph Checkpointer** — MemorySaver 实现 Graph 状态持久化，支持 interrupt/resume
+- [x] **Agent Loop 健壮性** — ErrorClassifier（6类错误→自动重试/降级）+ ToolGuardrails（循环检测→熔断）
+- [x] **中断/恢复机制** — 意图低置信度时 interrupt 暂停，POST /api/v1/resume 恢复
 
 ### 🟡 P1 — 高级 RAG & 知识（面试加分）
 
@@ -282,9 +289,9 @@ python tests/test_memory.py
 | 自注册工具表 + Toolset | `tools/registry.py` + `toolsets.py` | `tools/registry.py` |
 | 冻结快照 | `agent/memory_manager.py` | `core/memory_manager.py` |
 | Context Engine 抽象 | `agent/context_engine.py` | `core/context_compressor.py` |
-| Error Classifier | `agent/error_classifier.py` | TODO: P0 |
+| Error Classifier | `agent/error_classifier.py` | `core/error_classifier.py` ✅ |
 | Tool Guardrails | `agent/tool_guardrails.py` | TODO: P3 |
-| 多Agent委派 | `tools/delegate_tool.py` | `agents/` 子Agent编排 |
+| 多Agent委派 | `tools/delegate_tool.py` | `agents/` 4个专用子Agent + CSEngine路由 |
 | Sandbox 执行 | `tools/environments/` | TODO: P3 |
 
 ### 与 Hermes 的差异化

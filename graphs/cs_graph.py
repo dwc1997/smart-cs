@@ -1,13 +1,15 @@
 """LangGraph StateGraph 定义
 
 智能客服的 LangGraph 工作流图。
+支持 checkpointer（MemorySaver）实现状态持久化和 interrupt/resume。
 """
 
 import logging
 from typing import Any, Dict, Literal
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import MemorySaver
 
 from state.cs_states import (
     CSAssistantState, IntentType, IntentAnalysisResult,
@@ -28,12 +30,44 @@ async def classify_intent_node(state: CSAssistantState) -> CSAssistantState:
 
 
 async def confirm_intent_node(state: CSAssistantState) -> CSAssistantState:
-    """意图确认节点（低置信度时触发）。"""
-    logger.info("[Node: confirm_intent] Low confidence, requesting confirmation")
+    """意图确认节点（低置信度时触发）。
+
+    使用 LangGraph interrupt() 暂停图执行，等待用户确认后 resume。
+    当图在此节点中断时，状态会通过 checkpointer 自动保存，
+    客户端收到 interrupt 事件后可通过 /api/v1/resume 恢复执行。
+    """
+    logger.info("[Node: confirm_intent] Low confidence, interrupting for user confirmation")
     intent = state.get("intent_analysis", {})
+
+    # interrupt() 暂停图执行，将 payload 返回给调用方
+    # 当 resume 时，response 是用户提供的确认数据
+    user_response = interrupt({
+        "type": "needs_clarification",
+        "predicted_intent": intent.get("intent_type", "general"),
+        "confidence": intent.get("confidence", 0),
+        "summary": intent.get("summary", ""),
+        "message": (
+            f"我不太确定您的意图，您是想「{intent.get('summary', '咨询')}」吗？"
+            "请确认或补充说明。"
+        ),
+    })
+
+    # Resume: 用户已回复，根据回复更新状态
+    confirmed_intent = intent.get("intent_type", "general")
+    if isinstance(user_response, dict):
+        confirmed_intent = user_response.get("confirmed_intent", confirmed_intent)
+        user_message = user_response.get("message", "")
+    else:
+        user_message = str(user_response)
+
+    logger.info(f"[Node: confirm_intent] Resumed with intent={confirmed_intent}")
+
     return {
         **state,
         "current_step": WorkflowStep.CONFIRMING,
+        "confirmed_intent": confirmed_intent,
+        "intent_confirmed": True,
+        "user_query": f"{state.get('user_query', '')} [补充: {user_message}]" if user_message else state.get("user_query", ""),
         "metadata": {
             **state.get("metadata", {}),
             "confirm_payload": {
@@ -41,6 +75,8 @@ async def confirm_intent_node(state: CSAssistantState) -> CSAssistantState:
                 "confidence": intent.get("confidence", 0),
                 "summary": intent.get("summary", ""),
             },
+            "user_confirmed": True,
+            "user_response": user_response,
         },
     }
 
@@ -160,5 +196,21 @@ def create_cs_graph() -> StateGraph:
     return graph
 
 
-# 编译图
-cs_graph = create_cs_graph().compile()
+# ============================================================
+# Checkpointer（可替换为 SqliteSaver 做持久化）
+# ============================================================
+# 使用 MemorySaver：进程重启后状态丢失，适合开发/测试。
+# 生产环境可替换为 SqliteSaver:
+#   from langgraph.checkpoint.sqlite import SqliteSaver
+#   checkpointer = SqliteSaver.from_conn_string("checkpoints.db")
+checkpointer = MemorySaver()
+
+
+def create_compiled_graph(checkpointer_instance=None):
+    """创建编译后的图，可注入自定义 checkpointer。"""
+    cp = checkpointer_instance or checkpointer
+    return create_cs_graph().compile(checkpointer=cp)
+
+
+# 默认编译图（带 checkpointer）
+cs_graph = create_compiled_graph()

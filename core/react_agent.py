@@ -9,6 +9,7 @@
 - 重复检测
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ from config.settings import (
     OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
     MAX_ITERATIONS, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT,
 )
+from core.error_classifier import ErrorClassifier, RetryState
+from core.tool_guardrails import ToolGuardrails
 from tools.registry import registry
 
 
@@ -77,13 +80,17 @@ class ReActAgent:
             http_client=httpx.AsyncClient(proxy=proxy, timeout=timeout),
         )
         self._model = OPENAI_MODEL
+        self._error_classifier = ErrorClassifier()
 
     def request_interrupt(self):
         """请求中断循环。"""
         self._interrupt_requested = True
 
     async def _call_llm(self, messages: list, tools: list) -> dict:
-        """调用 LLM，返回原始 API 响应 dict。"""
+        """调用 LLM，返回原始 API 响应 dict。
+
+        Wraps the raw API call with ErrorClassifier-based retry logic.
+        """
         kwargs = {
             "model": self._model,
             "messages": messages,
@@ -92,8 +99,43 @@ class ReActAgent:
         }
         if tools:
             kwargs["tools"] = tools
-        resp = await self._client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.model_dump(exclude_none=True)
+
+        retry_state = RetryState()
+        last_exc: Optional[Exception] = None
+
+        while True:
+            try:
+                resp = await self._client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.model_dump(exclude_none=True)
+            except Exception as e:
+                last_exc = e
+                classification = self._error_classifier.classify(e)
+                attempt = retry_state.attempt(classification.category)
+
+                if classification.should_abort:
+                    logger.error(
+                        f"LLM call failed (abort): [{classification.category.value}] {e}"
+                    )
+                    raise
+
+                if classification.should_retry and attempt <= classification.max_retries:
+                    delay = self._error_classifier.backoff_delay(classification, retry_state)
+                    logger.warning(
+                        f"LLM call failed [{classification.category.value}], "
+                        f"retry {attempt}/{classification.max_retries} in {delay:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                if classification.should_compress:
+                    logger.warning(
+                        f"LLM call failed [{classification.category.value}]: {e}"
+                    )
+                    raise
+
+                # fallback_model or other — abort
+                logger.error(f"LLM call failed (unhandled): {e}")
+                raise
 
     async def run(
         self,
@@ -120,7 +162,7 @@ class ReActAgent:
         full_messages.extend(messages)
 
         tool_call_history = []
-        recent_tool_calls = []
+        guardrails = ToolGuardrails()
 
         while self._iteration_count < self.max_iterations:
             if self._interrupt_requested:
@@ -177,24 +219,30 @@ class ReActAgent:
                 except json.JSONDecodeError:
                     tool_args = {}
 
-                call_signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-                recent_tool_calls.append(call_signature)
-                if len(recent_tool_calls) > 3:
-                    recent_tool_calls.pop(0)
-                if len(recent_tool_calls) >= 3 and len(set(recent_tool_calls)) == 1:
-                    logger.warning(f"Detected repeated tool calls: {tool_name}")
+                if on_tool_call:
+                    on_tool_call(tool_name, tool_args)
+                tool_result = registry.dispatch(tool_name, tool_args)
+                if on_tool_result:
+                    on_tool_result(tool_name, tool_result)
+                tool_call_history.append({
+                    "tool": tool_name, "args": tool_args, "result": tool_result[:1000],
+                })
+
+                # Check guardrails after executing the tool
+                verdict = guardrails.check(tool_name, tool_args, tool_result)
+                if verdict.warning:
+                    logger.warning(f"[guardrails] {verdict.reason}")
+                if not verdict.ok:
+                    logger.warning(f"[guardrails] Hard stop: {verdict.reason}")
                     tool_result = json.dumps({
-                        "error": "检测到重复调用，已自动停止。请尝试不同的方法或直接回答用户。",
+                        "error": f"检测到循环调用，已自动停止。原因：{verdict.reason}。请尝试不同的方法或直接回答用户。",
                     }, ensure_ascii=False)
-                else:
-                    if on_tool_call:
-                        on_tool_call(tool_name, tool_args)
-                    tool_result = registry.dispatch(tool_name, tool_args)
-                    if on_tool_result:
-                        on_tool_result(tool_name, tool_result)
-                    tool_call_history.append({
-                        "tool": tool_name, "args": tool_args, "result": tool_result[:1000],
+                    full_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": tool_result,
                     })
+                    break
 
                 try:
                     result_data = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
@@ -216,7 +264,6 @@ class ReActAgent:
                     "tool_call_id": tc_id,
                     "content": tool_result,
                 })
-                recent_tool_calls = []
 
         return {
             "content": "抱歉，处理过程超时。请简化您的问题或联系人工客服。",
@@ -239,6 +286,7 @@ class ReActAgent:
             {"type": "tool_call", "name": "...", "args": {...}}
             {"type": "tool_result", "name": "...", "result": "..."}
             {"type": "clarification", "data": {...}}
+            {"type": "guardrail_warning", "reason": "..."}
             {"type": "final", "content": "...", "tool_calls": [...]}
             {"type": "error", "error": "..."}
         """
@@ -256,7 +304,7 @@ class ReActAgent:
         full_messages.extend(messages)
 
         tool_call_history = []
-        recent_tool_calls = []
+        guardrails = ToolGuardrails()
 
         while self._iteration_count < self.max_iterations:
             if self._interrupt_requested:
@@ -305,22 +353,30 @@ class ReActAgent:
 
                 yield {"type": "tool_call", "name": tool_name, "args": tool_args}
 
-                call_signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-                recent_tool_calls.append(call_signature)
-                if len(recent_tool_calls) > 3:
-                    recent_tool_calls.pop(0)
-
-                if len(recent_tool_calls) >= 3 and len(set(recent_tool_calls)) == 1:
-                    tool_result = json.dumps({"error": "重复调用已停止"}, ensure_ascii=False)
-                else:
-                    tool_result = registry.dispatch(tool_name, tool_args)
-                    recent_tool_calls = []
+                tool_result = registry.dispatch(tool_name, tool_args)
 
                 yield {"type": "tool_result", "name": tool_name, "result": tool_result[:500]}
 
                 tool_call_history.append({
                     "tool": tool_name, "args": tool_args, "result": tool_result[:1000],
                 })
+
+                # Check guardrails after executing the tool
+                verdict = guardrails.check(tool_name, tool_args, tool_result)
+                if verdict.warning:
+                    logger.warning(f"[guardrails] {verdict.reason}")
+                    yield {"type": "guardrail_warning", "reason": verdict.reason}
+                if not verdict.ok:
+                    logger.warning(f"[guardrails] Hard stop: {verdict.reason}")
+                    tool_result = json.dumps({
+                        "error": f"检测到循环调用，已自动停止。原因：{verdict.reason}。请尝试不同的方法或直接回答用户。",
+                    }, ensure_ascii=False)
+                    full_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": tool_result,
+                    })
+                    break
 
                 try:
                     result_data = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
